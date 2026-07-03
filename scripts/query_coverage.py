@@ -4,7 +4,7 @@ from __future__ import annotations
 import argparse
 import json
 from pathlib import Path
-from typing import Any, Dict
+from typing import Any, Dict, Optional
 
 
 def norm(p: str) -> str:
@@ -20,14 +20,14 @@ def main() -> int:
     args = ap.parse_args()
     data = json.loads(Path(args.coverage).read_text(encoding="utf-8"))
     wanted = norm(args.file)
-    match: Dict[str, Any] | None = None
+    match = None  # type: Optional[Dict[str, Any]]
     matched_name = ""
     for name, value in data.get("files", {}).items():
         if norm(name) == wanted or norm(name).endswith("/" + wanted):
             match, matched_name = value, name
             break
     if match is None:
-        raise SystemExit(f"file not found in coverage JSON: {args.file}")
+        raise SystemExit("file not found in coverage JSON: %s" % args.file)
 
     def in_range(n: Any) -> bool:
         return isinstance(n, int) and args.start <= n <= args.end

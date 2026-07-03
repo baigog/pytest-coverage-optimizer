@@ -2,10 +2,11 @@
 name: pytest-coverage-optimizer
 description: Systematically increase Python pytest line and branch coverage using machine-readable coverage data, AST-based target ranking, focused tests, and iterative verification. Use when asked to improve, repair, analyze, or maximize pytest coverage without manually reading HTML or terminal reports.
 license: MIT
-compatibility: OpenCode and Agent Skills compatible agents. Requires Python, pytest, coverage.py or pytest-cov; optional pytest-json-report.
+compatibility: OpenCode and Agent Skills compatible agents. Requires Python 3.7+, pytest, coverage.py or pytest-cov; optional pytest-json-report.
 metadata:
   author: OpenAI
-  version: "1.0.0"
+  version: "0.2.0"
+  python: ">=3.7"
   domain: python-testing
 ---
 
@@ -52,6 +53,10 @@ Inspect, in this order:
 
 Do not dump whole files into context. Search configuration keys and read only relevant sections.
 
+## Python 3.7 compatibility
+
+The bundled helper scripts must run on Python 3.7 and newer. Avoid PEP 604 union types (`X | Y`), structural pattern matching, built-in generic annotations such as `list[str]`, and direct references to AST node classes introduced after Python 3.7. CI validates the scripts on Python 3.7, 3.8, and a current Python release.
+
 ## Required artifacts
 
 Create all transient files below `.coverage-agent/` unless the repository already defines an artifact directory:
@@ -90,7 +95,7 @@ Alternative without pytest-cov:
 
 ```bash
 python -m coverage erase
-python -m coverage run --branch -m pytest <TEST_ROOT>
+python -m coverage run --branch --source=<SOURCE_ROOT> -m pytest <TEST_ROOT>
 python -m coverage json --show-contexts -o .coverage-agent/coverage.json
 ```
 

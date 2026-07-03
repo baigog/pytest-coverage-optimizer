@@ -1,5 +1,8 @@
 #!/usr/bin/env python3
-"""Rank Python functions/classes/modules by estimated pytest coverage ROI."""
+"""Rank Python symbols by estimated pytest coverage return on investment.
+
+Compatible with Python 3.7 and newer.
+"""
 from __future__ import annotations
 
 import argparse
@@ -9,11 +12,18 @@ import json
 import math
 import os
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Sequence, Set, Tuple
+from typing import Any, Dict, Iterable, List, NamedTuple, Sequence, Set, Tuple
+
+
+class Symbol(NamedTuple):
+    name: str
+    kind: str
+    node: ast.AST
+    descendant_spans: Tuple[Tuple[int, int], ...]
 
 
 def ranges_to_lines(values: Sequence[Any]) -> Set[int]:
-    out: Set[int] = set()
+    out = set()  # type: Set[int]
     for value in values or []:
         if isinstance(value, int):
             out.add(value)
@@ -27,7 +37,7 @@ def node_end(node: ast.AST) -> int:
     end = getattr(node, "end_lineno", None)
     if isinstance(end, int):
         return end
-    maximum = getattr(node, "lineno", 1)
+    maximum = int(getattr(node, "lineno", 1))
     for child in ast.walk(node):
         maximum = max(maximum, int(getattr(child, "lineno", maximum)))
     return maximum
@@ -38,13 +48,14 @@ def complexity(node: ast.AST) -> int:
         ast.If, ast.For, ast.AsyncFor, ast.While, ast.Try, ast.With,
         ast.AsyncWith, ast.IfExp, ast.Assert, ast.comprehension,
     )
+    match_type = getattr(ast, "Match", None)
     score = 1
     for child in ast.walk(node):
         if isinstance(child, branch_nodes):
             score += 1
         elif isinstance(child, ast.BoolOp):
             score += max(1, len(child.values) - 1)
-        elif isinstance(child, ast.Match):
+        elif match_type is not None and isinstance(child, match_type):
             score += max(1, len(child.cases))
     return score
 
@@ -78,19 +89,47 @@ def public_bonus(name: str, kind: str) -> float:
     return 0.5 if not name.split(".")[-1].startswith("_") else 0.0
 
 
-def iter_symbols(tree: ast.AST) -> Iterable[Tuple[str, str, ast.AST]]:
-    yield "<module>", "module", tree
+def _child_symbol_nodes(node: ast.AST) -> Iterable[ast.AST]:
+    for child in ast.iter_child_nodes(node):
+        if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            yield child
+        else:
+            for nested in _child_symbol_nodes(child):
+                yield nested
 
-    def walk(body: Sequence[ast.stmt], prefix: str = "") -> Iterable[Tuple[str, str, ast.AST]]:
+
+def _all_descendant_symbol_spans(node: ast.AST) -> Tuple[Tuple[int, int], ...]:
+    spans = []  # type: List[Tuple[int, int]]
+    for child in _child_symbol_nodes(node):
+        spans.append((int(getattr(child, "lineno", 1)), node_end(child)))
+    return tuple(spans)
+
+
+def iter_symbols(tree: ast.AST) -> Iterable[Symbol]:
+    yield Symbol("<module>", "module", tree, _all_descendant_symbol_spans(tree))
+
+    def walk(body: Sequence[ast.stmt], prefix: str = "") -> Iterable[Symbol]:
         for node in body:
             if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                name = f"{prefix}{node.name}"
-                yield name, "function", node
+                name = "%s%s" % (prefix, node.name)
+                yield Symbol(name, "function", node, _all_descendant_symbol_spans(node))
+                for item in walk(node.body, name + "."):
+                    yield item
             elif isinstance(node, ast.ClassDef):
-                cname = f"{prefix}{node.name}"
-                yield cname, "class", node
-                yield from walk(node.body, cname + ".")
-    yield from walk(getattr(tree, "body", []))
+                cname = "%s%s" % (prefix, node.name)
+                yield Symbol(cname, "class", node, _all_descendant_symbol_spans(node))
+                for item in walk(node.body, cname + "."):
+                    yield item
+
+    for symbol in walk(getattr(tree, "body", [])):
+        yield symbol
+
+
+def owned_span(start: int, end: int, descendant_spans: Sequence[Tuple[int, int]]) -> Set[int]:
+    lines = set(range(start, end + 1))
+    for child_start, child_end in descendant_spans:
+        lines.difference_update(range(child_start, child_end + 1))
+    return lines
 
 
 def normalized(path: str) -> str:
@@ -125,18 +164,22 @@ def rank_file(root: Path, reported_path: str, cov: Dict[str, Any]) -> List[Dict[
     missing = ranges_to_lines(cov.get("missing_lines", []))
     executable = executed | missing
     missing_branches = cov.get("missing_branches", []) or []
-    results: List[Dict[str, Any]] = []
+    results = []  # type: List[Dict[str, Any]]
 
-    for name, kind, node in iter_symbols(tree):
+    for symbol in iter_symbols(tree):
+        name, kind, node, descendants = symbol
         start = 1 if kind == "module" else int(getattr(node, "lineno", 1))
         end = node_end(node) if kind != "module" else max(1, len(text.splitlines()))
-        span = set(range(start, end + 1))
+        span = owned_span(start, end, descendants)
         symbol_exec = executable & span
         symbol_missing = missing & span
         if not symbol_exec or not symbol_missing:
             continue
         symbol_covered = executed & span
-        arcs = [arc for arc in missing_branches if isinstance(arc, list) and arc and arc[0] in span]
+        arcs = [
+            arc for arc in missing_branches
+            if isinstance(arc, list) and arc and arc[0] in span
+        ]
         comp = complexity(node)
         dep = dependency_cost(node)
         missing_count = len(symbol_missing)
@@ -147,7 +190,7 @@ def rank_file(root: Path, reported_path: str, cov: Dict[str, Any]) -> List[Dict[
         risk_bonus = min(2.0, math.log2(1 + comp) * 0.35)
         score = (gain * (0.65 + density) * (1.0 + public_bonus(name, kind) + risk_bonus)) / setup_cost
         results.append({
-            "file": normalized(os.path.relpath(source_path, root)),
+            "file": normalized(os.path.relpath(str(source_path), str(root))),
             "symbol": name,
             "kind": kind,
             "start_line": start,
@@ -181,14 +224,14 @@ def main() -> int:
     try:
         data = json.loads(Path(args.coverage).read_text(encoding="utf-8"))
     except (OSError, UnicodeError, json.JSONDecodeError) as exc:
-        parser.error(f"cannot read coverage JSON: {exc}")
+        parser.error("cannot read coverage JSON: %s" % exc)
 
     default_excludes = [
         "*/site-packages/*", "*/dist-packages/*", "*/.venv/*", "*/venv/*",
         "*/migrations/*", "*/generated/*", "*/__pycache__/*",
     ]
     excludes = default_excludes + list(args.exclude)
-    ranked: List[Dict[str, Any]] = []
+    ranked = []  # type: List[Dict[str, Any]]
     for reported_path, cov in extract_file_data(data).items():
         p = normalized(reported_path)
         if args.include and not matches(p, args.include):
@@ -197,13 +240,15 @@ def main() -> int:
             continue
         ranked.extend(rank_file(root, reported_path, cov))
 
-    ranked.sort(key=lambda item: (-item["priority_score"], -item["estimated_gain_units"], item["file"], item["start_line"]))
+    ranked.sort(key=lambda item: (
+        -item["priority_score"], -item["estimated_gain_units"],
+        item["file"], item["start_line"],
+    ))
     ranked = ranked[: max(0, args.top)]
-    totals = data.get("totals", {})
     payload = {
         "schema_version": 1,
         "source_coverage": str(Path(args.coverage)),
-        "coverage_totals": totals,
+        "coverage_totals": data.get("totals", {}),
         "target_count": len(ranked),
         "targets": ranked,
     }

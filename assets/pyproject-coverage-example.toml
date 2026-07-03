@@ -1,0 +1,17 @@
+# Merge selectively into the project's existing pyproject.toml.
+[tool.coverage.run]
+branch = true
+parallel = true
+source = ["src"]
+
+[tool.coverage.report]
+show_missing = true
+skip_covered = false
+exclude_also = [
+  "if TYPE_CHECKING:",
+  "raise NotImplementedError",
+]
+
+[tool.coverage.json]
+show_contexts = true
+pretty_print = false

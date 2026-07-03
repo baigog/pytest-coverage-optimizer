@@ -6,7 +6,7 @@ from pathlib import Path
 
 def run_script(script, *args):
     cmd = [sys.executable, str(script)] + list(args)
-    return subprocess.run(cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    return subprocess.run(cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True)
 
 
 def test_ranker_avoids_module_and_class_duplication(tmp_path):
@@ -48,7 +48,7 @@ def test_ranker_avoids_module_and_class_duplication(tmp_path):
     data = json.loads(out_path.read_text(encoding="utf-8"))
     by_symbol = {item["symbol"]: item for item in data["targets"]}
 
-    assert by_symbol["<module>"]["missing_lines"] == [] if "<module>" in by_symbol else True
+    assert "<module>" not in by_symbol
     assert by_symbol["Demo"]["missing_lines"] == [4]
     assert by_symbol["Demo.method"]["missing_lines"] == [9]
     assert by_symbol["Demo.method"]["missing_branches"] == [[7, 9]]
@@ -86,10 +86,8 @@ def test_query_coverage_returns_requested_slice(tmp_path):
     assert data["contexts"] == {"2": ["test_a"]}
 
 
-def test_scripts_parse_with_python_37_grammar():
-    import ast
-
+def test_scripts_compile_on_current_interpreter():
     root = Path(__file__).parents[1]
     for path in [root / "scripts" / "coverage_rank.py", root / "scripts" / "query_coverage.py"]:
         source = path.read_text(encoding="utf-8")
-        ast.parse(source, filename=str(path), feature_version=(3, 7))
+        compile(source, str(path), "exec")

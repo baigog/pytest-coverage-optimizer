@@ -1,6 +1,20 @@
 # pytest-coverage-optimizer
 
-Agent Skill for increasing pytest line and branch coverage using coverage.py JSON, AST-based target prioritization, and a focused verification loop.
+Agent Skill for increasing pytest line and branch coverage with coverage.py JSON, deterministic target classes, one-target test generation, and verified feedback.
+
+The methodology is designed for agents using modest models: the script selects and describes candidates mechanically, while the agent follows a fixed gate and may attempt only one target at a time.
+
+## What changed in methodology v0.3
+
+The previous scalar ROI heuristic was replaced by explicit A-E selection classes:
+
+- existing test evidence and setup tier determine the class;
+- missing branches, missing lines, and owned-scope complexity determine order within the class;
+- prior accepted, failed, rejected, and no-gain iterations adjust later rankings;
+- stable rejected targets are skipped;
+- each candidate contains an explicit agent action, limits, and rejection reason codes.
+
+See [`references/scoring.md`](references/scoring.md) for the complete deterministic rules.
 
 ## Python compatibility
 
@@ -15,11 +29,11 @@ python3.7 -m pip install \
   "coverage==6.5.0"
 ```
 
-`pytest-json-report` is optional. Do not require `pytest-cov` to emit JSON directly.
+`pytest-json-report` is optional. Do not require pytest-cov to emit JSON directly.
 
 ## Machine-readable coverage workflow
 
-Use pytest-cov only to collect coverage data and suppress human-readable reports:
+Use pytest-cov to collect data and coverage.py to emit JSON:
 
 ```bash
 mkdir -p .coverage-agent
@@ -28,19 +42,27 @@ python3.7 -m pytest \
   --cov=<SOURCE_ROOT> \
   --cov-branch \
   --cov-report= \
+  --cov-context=test \
   <TEST_ROOT>
 python3.7 -m coverage json \
   --show-contexts \
   -o .coverage-agent/coverage.json
 ```
 
-Do **not** depend on:
+Do not depend on `--cov-report=json`; older pytest-cov versions may not expose that format.
+
+Generate the deterministic queue:
 
 ```bash
---cov-report=json
+python3.7 scripts/coverage_rank.py \
+  --coverage .coverage-agent/coverage.json \
+  --root . \
+  --tests-root tests \
+  --history .coverage-agent/iterations.jsonl \
+  --output .coverage-agent/ranking.json
 ```
 
-Older pytest-cov installations may not expose that report format. The separate `coverage json` command is the canonical workflow used by this skill.
+Omit `--history` on the first run.
 
 Without pytest-cov:
 

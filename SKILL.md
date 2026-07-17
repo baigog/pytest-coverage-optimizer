@@ -1,97 +1,87 @@
 ---
 name: pytest-coverage-optimizer
-description: Systematically increase Python pytest line and branch coverage using machine-readable coverage data, AST-based target ranking, focused tests, and iterative verification. Use when asked to improve, repair, analyze, or maximize pytest coverage without manually reading HTML or terminal reports.
+description: Increase Python pytest line and branch coverage with machine-readable coverage, deterministic target classes, one-target test generation, and verified feedback. Use when asked to improve or analyze pytest coverage without manually reading HTML or terminal reports.
 license: MIT
 compatibility: OpenCode and Agent Skills compatible agents. Requires Python 3.7+, pytest, coverage.py or pytest-cov; optional pytest-json-report.
 metadata:
   author: OpenAI
-  version: "0.2.0"
+  version: "0.3.0"
   python: ">=3.7"
   domain: python-testing
 ---
 
 # Pytest Coverage Optimizer
 
-Use this skill to improve test coverage efficiently. Treat coverage improvement as an optimization problem, not as a request to make every file green.
+Follow this state machine exactly. Do not replace it with an improvised repository-wide review.
 
 ## Objective
 
-Maximize **verified coverage gain per unit of implementation and execution cost**, while preserving behavior and test quality.
+Increase verified line and branch coverage with meaningful behavioral assertions while minimizing source files read, test attempts, and full-suite executions.
 
-The default optimization order is:
-
-1. Restore a clean, passing baseline.
-2. Measure line and branch coverage in JSON.
-3. Rank executable targets by expected gain, cost, risk, and reachability.
-4. Add the smallest meaningful tests for the highest-value target.
-5. Run only affected tests first.
-6. Recompute global coverage and repeat.
-7. Stop when the requested threshold is reached or remaining gaps are justified exclusions, unreachable defensive paths, or disproportionately expensive integration behavior.
+The ranking script makes the mechanical target-selection decisions. The agent validates reachability and writes tests for one target at a time.
 
 ## Non-negotiable rules
 
-- Never optimize from HTML, ANSI terminal tables, screenshots, or prose reports when JSON is available.
-- Never modify production behavior merely to make a line executable.
-- Never write assertion-free tests or tests that only check that code does not crash.
-- Prefer externally visible behavior over private implementation details.
+- Use machine-readable coverage JSON. Do not rank targets from HTML, screenshots, ANSI tables, or prose.
 - Enable branch coverage unless the project explicitly measures lines only.
-- Preserve the existing test style, fixtures, markers, and dependency policy.
-- Do not run the entire suite after every edit when a focused subset can validate the change.
-- Do not chase generated files, migrations, vendored code, protocol stubs, or type-only code unless explicitly required.
-- Never claim a gain until it is confirmed by a fresh coverage run.
-
-## Inputs to discover
-
-Inspect, in this order:
-
-1. `pyproject.toml`, `pytest.ini`, `tox.ini`, `setup.cfg`, `.coveragerc`.
-2. Dependency files and supported Python version.
-3. Source roots and test roots.
-4. Existing fixtures in `conftest.py`.
-5. Current test command from CI, Makefile, tox, nox, scripts, or project docs.
-6. Coverage omit/include rules and threshold.
-
-Do not dump whole files into context. Search configuration keys and read only relevant sections.
-
-## Python 3.7 compatibility
-
-The bundled helper scripts must run on Python 3.7 and newer. Avoid PEP 604 union types (`X | Y`), structural pattern matching, built-in generic annotations such as `list[str]`, and direct references to AST node classes introduced after Python 3.7. CI validates the scripts on Python 3.7, 3.8, and a current Python release.
+- Do not modify production behavior solely to increase coverage.
+- Do not add assertion-free tests or tests that only prove code does not crash.
+- Prefer public return values, state changes, emitted data, persisted data, and documented exceptions.
+- Preserve existing fixtures, markers, naming, and dependency policy.
+- Work on one target per iteration.
+- Make at most two test attempts for one target before deferring it.
+- Never claim coverage gain until a fresh global coverage run confirms it.
+- Never reorder candidate classes using intuition. Use the selection protocol below.
 
 ## Required artifacts
 
-Create all transient files below `.coverage-agent/` unless the repository already defines an artifact directory:
+Create transient files below `.coverage-agent/`:
 
-- `.coverage-agent/coverage.json`: coverage.py JSON with branches.
-- `.coverage-agent/tests.json`: pytest execution metadata when `pytest-json-report` is installed.
-- `.coverage-agent/ranking.json`: ranked code targets from `scripts/coverage_rank.py`.
-- `.coverage-agent/baseline.json`: baseline summary and command metadata.
-- `.coverage-agent/iterations.jsonl`: one compact JSON object per optimization iteration.
+- `coverage.json`: global line and branch coverage.
+- `tests.json`: optional pytest execution metadata.
+- `ranking.json`: deterministic target queue.
+- `baseline.json`: baseline commands and metrics.
+- `iterations.jsonl`: one compact result per attempted or rejected target.
 
-Add `.coverage-agent/` to `.git/info/exclude` rather than changing `.gitignore`, unless the user asks for a committed workflow.
+Add `.coverage-agent/` to `.git/info/exclude`, not `.gitignore`, unless the user asks to commit the workflow.
 
-## Phase 0 — Establish a trustworthy baseline
+## State 0 — Discover the canonical commands
 
-Determine the canonical test command. Use `python -m pytest`, not a bare `pytest`, to bind execution to the selected interpreter.
+Read only relevant sections of these files, in this order:
 
-Recommended command when pytest-cov is available:
+1. `pyproject.toml`, `pytest.ini`, `tox.ini`, `setup.cfg`, `.coveragerc`.
+2. CI, Makefile, tox, nox, or project documentation containing the test command.
+3. Dependency files and supported Python versions.
+4. Source roots and test roots.
+5. `conftest.py` and nearby tests only when a candidate requires them.
+
+Use `python -m pytest`, not bare `pytest`.
+
+## State 1 — Establish a passing baseline
+
+With pytest-cov:
 
 ```bash
 mkdir -p .coverage-agent
+python -m coverage erase
 python -m pytest \
   --cov=<SOURCE_ROOT> \
   --cov-branch \
   --cov-report= \
   --cov-context=test \
-  --json-report \
-  --json-report-file=.coverage-agent/tests.json \
-  --json-report-omit=streams log warnings keywords \
   <TEST_ROOT>
 python -m coverage json --show-contexts -o .coverage-agent/coverage.json
 ```
 
-If `pytest-json-report` is unavailable, omit its options. Do not install new dependencies unless project policy permits it; coverage JSON alone is sufficient.
+When `pytest-json-report` is already available, add:
 
-Alternative without pytest-cov:
+```bash
+--json-report \
+--json-report-file=.coverage-agent/tests.json \
+--json-report-omit=streams log warnings keywords
+```
+
+Without pytest-cov:
 
 ```bash
 python -m coverage erase
@@ -99,31 +89,11 @@ python -m coverage run --branch --source=<SOURCE_ROOT> -m pytest <TEST_ROOT>
 python -m coverage json --show-contexts -o .coverage-agent/coverage.json
 ```
 
-If the baseline fails:
+If the baseline fails, stop coverage optimization. Fix only environment or collection failures required to run the existing suite unless the user also requested test repair.
 
-1. Save the failure metadata.
-2. Separate environment/import/dependency failure from actual test failure.
-3. Fix only infrastructure necessary to run the existing suite.
-4. Do not start coverage optimization while the baseline is red unless the user explicitly asks to repair failing tests too.
+Record exact baseline line percentage, branch percentage, missing lines, missing branches, interpreter, and command in `baseline.json`.
 
-Record:
-
-```json
-{
-  "python": "3.x.y",
-  "command": "...",
-  "tests_passed": 0,
-  "tests_failed": 0,
-  "line_percent": 0.0,
-  "branch_percent": 0.0,
-  "covered_lines": 0,
-  "missing_lines": 0,
-  "covered_branches": 0,
-  "missing_branches": 0
-}
-```
-
-## Phase 1 — Produce a machine-ranked work queue
+## State 2 — Generate the deterministic queue
 
 Run:
 
@@ -131,176 +101,151 @@ Run:
 python <SKILL_ROOT>/scripts/coverage_rank.py \
   --coverage .coverage-agent/coverage.json \
   --root . \
-  --output .coverage-agent/ranking.json
-```
-
-Optional filters:
-
-```bash
-python <SKILL_ROOT>/scripts/coverage_rank.py \
-  --coverage .coverage-agent/coverage.json \
-  --root . \
-  --include 'src/**/*.py' \
-  --exclude '*/generated/*' '*/migrations/*' \
+  --tests-root <TEST_ROOT> \
+  --history .coverage-agent/iterations.jsonl \
   --top 30 \
   --output .coverage-agent/ranking.json
 ```
 
-Read only the first 5–10 ranked entries, not the complete report. Each entry contains:
+Omit `--history` only on the first iteration. Repeat `--tests-root` for multiple test roots.
 
-- source file and symbol;
-- executable, covered, and missing lines;
-- missing branch arcs where available;
-- estimated maximum line gain;
-- complexity and dependency indicators;
-- priority score;
-- exact source spans to inspect.
+The ranker produces these classes:
 
-See [references/scoring.md](references/scoring.md) for the ranking model.
+| Class | Meaning | Agent action |
+|---|---|---|
+| A | Public function, local or fixture-only setup, strong nearby test evidence | Attempt first |
+| B | Public function, local or fixture-only setup, weaker nearby test evidence | Attempt after A |
+| C | Public function, local or fixture-only setup, no nearby test evidence | Inspect, then attempt |
+| D | Private/concurrent target with existing test evidence | Attempt only when A-C are absent |
+| E | External-infrastructure, module-body, class-body, or otherwise costly target | Do not attempt automatically |
+| Z | Stable rejection already recorded in history | Skip |
 
-## Phase 2 — Validate the highest-value target
+Within a class, the ranker orders by:
 
-For each candidate, inspect only:
+1. More missing branch arcs.
+2. More missing executable lines.
+3. Lower owned-scope complexity.
+4. File path and source line for deterministic ties.
 
-1. The target function/class span.
-2. Directly imported collaborators used by the target.
-3. Existing tests for the same module or public API.
-4. Relevant fixtures.
-5. Missing branch lines from `coverage.json`.
+Do not invent a new score. Do not move an E target above an A-D target.
 
-Reject or defer a candidate when:
+## State 3 — Select exactly one target
 
-- it is dead, deprecated, generated, platform-specific, or intentionally unreachable;
-- testing it requires unavailable external infrastructure;
-- uncovered lines are exception guards with no realistic trigger;
-- the apparent gain comes primarily from import-time execution rather than meaningful behavior;
-- a lower-ranked target gives a much cheaper verified gain.
+Read candidate summaries only. Apply this exact selection rule:
 
-When rejecting a target, append a compact reason to `iterations.jsonl` and continue.
+1. Select the first class A target.
+2. If no A exists, select the first B target.
+3. If no A or B exists, select the first C target.
+4. If no A-C exists, select the first D target only when `test_evidence.paths` is non-empty.
+5. If only E targets remain, stop and report that the remaining work requires manual integration decisions.
 
-## Phase 3 — Design tests from paths, not lines
+After selecting a target, read no more than:
 
-Translate missing lines and branch arcs into behavior partitions.
+- the target source span;
+- the first matching test file from `test_evidence.paths`, when present;
+- the relevant fixture definitions;
+- directly used collaborator definitions only when required to construct inputs.
 
-For a target, enumerate only distinct control-flow cases needed to execute missing behavior:
+Maximum source/test files read for one target: four.
 
-- normal path;
-- each uncovered `if`/`elif` outcome;
-- loop empty/non-empty and boundary cases;
-- expected exception path;
-- collaborator success/failure;
-- state transition before/after;
-- serialization or parsing boundary;
-- async completion/cancellation where applicable.
+## State 4 — Candidate gate
 
-Use equivalence partitioning. One parametrized test should cover multiple equivalent inputs when assertions remain clear.
+Answer each gate with YES or NO before editing tests. Use the first matching rejection rule.
 
-Test priority inside a symbol:
+1. **Countable code:** Is the target generated, vendored, migration-only, unsupported-platform-only, deprecated, or type-only?
+   - YES: record `status=rejected` with `reason_code=GENERATED`, `VENDORED`, or `PLATFORM_UNSUPPORTED`.
+2. **Reachable behavior:** Can a supported public call reach the missing behavior?
+   - NO: record `status=rejected`, `reason_code=UNREACHABLE`.
+3. **Observable contract:** Can the test assert a return value, state change, exception contract, emitted/persisted data, or required collaborator interaction?
+   - NO: record `status=rejected`, `reason_code=NO_ASSERTABLE_BEHAVIOR`.
+4. **Available setup:** Can existing fixtures, real lightweight values, `tmp_path`, or `monkeypatch` provide the setup?
+   - NO, and external infrastructure is required: record `status=deferred`, `reason_code=EXTERNAL_INFRA_REQUIRED`.
+5. **Distinct path:** Does the proposed test execute a currently missing line or branch rather than duplicate an existing context?
+   - NO: choose another input path. If none exists, record `status=no_gain`, `reason_code=DUPLICATE_PATH`.
 
-1. Public return values and state changes.
-2. Error contracts and validation.
-3. High-risk branches involving money, persistence, permissions, concurrency, or destructive behavior.
-4. Boundary conditions.
-5. Low-value formatting and logging branches.
+After a rejection or deferral, append history, regenerate `ranking.json`, and return to State 3.
 
-## Phase 4 — Implement minimal meaningful tests
+## State 5 — Write one explicit test plan
 
-Prefer this order:
+Before editing, write this four-field plan in scratch output:
 
-1. Reuse existing fixtures.
-2. Construct real lightweight values.
-3. Use `tmp_path`, `monkeypatch`, `capsys`, `caplog`, and pytest parametrization.
-4. Mock only process/network/time/randomness/filesystem boundaries or expensive collaborators.
-5. Patch where the dependency is looked up, not where it was originally defined.
+```text
+TARGET: <file::symbol>
+SETUP: <fixtures and inputs>
+ACTION: <single public call>
+ASSERT: <exact observable result>
+COVERS: <missing line numbers and/or branch arcs>
+```
 
-Each test must contain assertions that would fail under a plausible defect. Good assertions include:
+If `ASSERT` is vague, do not write the test. Return to the candidate gate.
 
-- exact or structural return value;
-- state transition;
-- exception type and relevant message;
-- collaborator call arguments when that interaction is the contract;
-- persisted/serialized output;
-- invariant across parametrized inputs.
+Test construction order:
 
-Avoid over-mocking internal functions because it can execute lines without validating behavior.
+1. Extend the first existing matching test file.
+2. Reuse existing fixtures.
+3. Use real lightweight values.
+4. Use pytest built-ins such as `tmp_path`, `monkeypatch`, `capsys`, `caplog`, and parametrization.
+5. Mock only external boundaries or expensive collaborators.
+6. Patch where the collaborator is looked up.
 
-## Phase 5 — Fast verification loop
+Do not mock the target itself. Avoid mocking internal functions merely to execute lines.
 
-After editing tests:
+## State 6 — Two-attempt verification limit
 
-1. Run the changed test node(s):
+Attempt 1:
+
+1. Add the smallest test implementing the plan.
+2. Run only the changed test node.
+3. When it passes, run the test module.
+4. Measure focused coverage for the target module when practical.
 
 ```bash
 python -m pytest -q path/to/test_file.py::test_name
-```
-
-2. Run the target test module:
-
-```bash
 python -m pytest -q path/to/test_file.py
 ```
 
-3. Recompute focused coverage when supported:
+Attempt 2 is allowed only to correct one of these concrete problems:
 
-```bash
-python -m pytest -q path/to/test_file.py \
-  --cov=<TARGET_MODULE_OR_PACKAGE> --cov-branch --cov-report=
-python -m coverage json -o .coverage-agent/coverage-focused.json
-```
+- incorrect fixture or constructor;
+- incorrect patch location;
+- incorrect expected value;
+- test reached the target but missed the intended path.
 
-4. Once focused tests pass, run the canonical global coverage command.
-5. Regenerate `ranking.json`.
-6. Verify that the intended missing lines/arcs disappeared.
-
-Append one JSON object to `.coverage-agent/iterations.jsonl`:
+After two failed attempts, stop editing that target. Append:
 
 ```json
-{"target":"pkg/mod.py::Class.method","tests":["tests/test_mod.py::test_case"],"before":{"lines":71.2,"branches":55.0},"after":{"lines":73.8,"branches":61.0},"gain":{"lines":2.6,"branches":6.0},"status":"accepted"}
+{"target":"pkg/mod.py::symbol","status":"failed","reason_code":"ATTEMPT_LIMIT","tests":["tests/test_mod.py::test_name"]}
 ```
 
-If coverage does not improve, determine whether:
+Then regenerate the queue. Do not continue improvising on the same target.
 
-- the new test never reached the target;
-- the wrong module was measured;
-- a subprocess was not measured;
-- exclusions or source mapping hide the lines;
-- the test duplicated an already-covered path;
-- the intended branch is optimized away or version-dependent.
+## State 7 — Verify globally and record evidence
 
-Delete or strengthen tests that add no behavioral value.
+After the focused test passes:
 
-## Phase 6 — Re-rank and repeat
+1. Run the canonical global coverage command.
+2. Regenerate `coverage.json`.
+3. Confirm the intended missing lines or branch arcs disappeared.
+4. Confirm branch coverage did not regress.
+5. Append one history object.
 
-After every accepted target, regenerate the ranking. Coverage gain changes the marginal value of remaining targets.
+Accepted example:
 
-Use batches of at most three tightly related targets when setup is shared. Otherwise make one target per iteration.
+```json
+{"target":"pkg/mod.py::Parser.parse","status":"accepted","reason_code":"VERIFIED_GAIN","tests":["tests/test_mod.py::test_parse_empty"],"before":{"missing_lines":4,"missing_branches":2},"after":{"missing_lines":1,"missing_branches":0},"gain":{"lines":3,"branches":2}}
+```
 
-Stop reading source once enough information exists to write and verify the next test. Do not map the entire repository before acting.
+No-gain example:
 
-## Choosing the next target
+```json
+{"target":"pkg/mod.py::Parser.parse","status":"no_gain","reason_code":"DUPLICATE_PATH","tests":["tests/test_mod.py::test_parse_empty"]}
+```
 
-Use the ranking score as a starting point, then apply these tie-breakers:
+Regenerate `ranking.json` after every history append. A successful target in one file promotes remaining targets in that file because fixture setup may be reusable. Two no-gain or failed attempts demote a target. Stable rejection reason codes place it in class Z.
 
-1. More missing executable lines reachable through one public entry point.
-2. More missing branches covered by the same fixture setup.
-3. Existing nearby tests that can be extended.
-4. Lower external dependency and nondeterminism cost.
-5. Higher business risk.
+## Coverage contexts
 
-A file with 30 missing lines may be better than one with 100 missing lines if those 30 are reachable with two deterministic unit tests and the 100 require an integration environment.
-
-## Coverage contexts and test-to-code mapping
-
-When `--cov-context=test` is available, request `--show-contexts` in JSON. Use contexts to answer:
-
-- which tests already execute a line;
-- whether a proposed test duplicates an existing path;
-- which narrow test subset can validate a change;
-- whether a broad integration test is the only current caller.
-
-Do not load all contexts into the model. Query only the target file and line range using `scripts/query_coverage.py`.
-
-Example:
+Use contexts only for the selected target:
 
 ```bash
 python <SKILL_ROOT>/scripts/query_coverage.py \
@@ -309,64 +254,42 @@ python <SKILL_ROOT>/scripts/query_coverage.py \
   --start 40 --end 95
 ```
 
-## Branch interpretation
+Use the result to identify existing tests and avoid duplicate paths. Do not load every context into the model.
 
-Line coverage alone can report a conditional line as covered while one outcome is untested. Prioritize uncovered branch arcs in logic-heavy code.
+## Stop conditions
 
-For an arc `[from, to]`:
+Stop when any condition is true:
 
-- positive `to` is a destination line;
-- negative values can represent entry/exit arcs depending on coverage.py representation;
-- inspect the local AST/control flow before designing a test;
-- verify the arc disappears from `missing_branches` after the test.
+- requested line and branch thresholds are verified;
+- no class A-D candidates remain;
+- remaining targets require unavailable external infrastructure;
+- every remaining reachable target has reached the two-attempt limit;
+- remaining gaps have documented stable rejection reasons.
 
-## Exclusions
+Do not create fake tests for unreachable or excluded code. Prefer explicit coverage configuration only when the code truly should not count.
 
-Prefer configuration exclusions over fake tests for code that should not count:
+## Optional mutation check
 
-- `if TYPE_CHECKING:`;
-- abstract-method placeholders;
-- defensive `raise AssertionError("unreachable")` with a proven invariant;
-- platform branches outside the supported matrix;
-- generated code.
+Coverage proves execution, not fault detection. Run mutation testing only for changed targets when the project already uses a mutation tool or the user explicitly requests it. Do not run repository-wide mutation testing by default.
 
-Do not add exclusions solely because a path is inconvenient. Explain each new exclusion in the final report.
+## Completion report
 
-## Mutation testing: optional quality gate
-
-Coverage says code executed; it does not prove assertions detect wrong behavior. After reaching the line/branch goal, mutation-test only the changed target or package when the project already uses a mutation tool or the user asks for stronger validation.
-
-Do not run repository-wide mutation testing by default. It is expensive and is a second-stage quality check, not the primary coverage discovery mechanism.
-
-## Completion criteria
-
-A coverage task is complete only when:
-
-- the canonical suite passes;
-- fresh machine-readable coverage confirms the target threshold or documented best achievable result;
-- branch coverage did not regress;
-- added tests assert behavior;
-- no production semantics were weakened;
-- generated/transient artifacts are not accidentally committed;
-- the final response reports exact before/after metrics, tests added, remaining gaps, and any exclusions.
-
-## Final response format
-
-Return a compact summary:
+Report exact verified values:
 
 ```text
-Coverage: 72.4% -> 81.7% lines; 58.2% -> 74.0% branches
-Tests added/changed: 7
-Highest-impact targets covered: ...
-Validation: <canonical command> (passed)
-Remaining gaps: ...
-Exclusions added: none
+Coverage: <before> -> <after> lines; <before> -> <after> branches
+Targets accepted: <count>
+Targets deferred/rejected: <count and reason codes>
+Tests added/changed: <paths or node IDs>
+Validation: <canonical command and result>
+Remaining classes: <A/B/C/D/E counts>
+Exclusions added: <none or explicit list>
 ```
 
-Never report only “coverage improved.” Include exact verified metrics.
+Never report only that coverage improved.
 
 ## Supporting material
 
-- Ranking details: [references/scoring.md](references/scoring.md)
+- Deterministic ranking: [references/scoring.md](references/scoring.md)
 - Failure and environment handling: [references/failure-playbook.md](references/failure-playbook.md)
 - Machine-readable schemas: [references/data-contracts.md](references/data-contracts.md)

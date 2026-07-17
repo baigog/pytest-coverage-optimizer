@@ -1,154 +1,108 @@
 #!/usr/bin/env python3
-"""Rank Python symbols by estimated pytest coverage return on investment.
-
-Compatible with Python 3.7 and newer.
-"""
+"""Rank Python coverage targets with deterministic agent-friendly classes."""
 from __future__ import annotations
 
 import argparse
 import ast
-import fnmatch
 import json
-import math
 import os
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, NamedTuple, Sequence, Set, Tuple
+from typing import Any, Dict, List, Sequence
+
+from ranking_ast import (
+    boundary_analysis, complexity, import_aliases, iter_symbols, node_end,
+    owned_span, public_symbol, ranges_to_lines,
+)
+from ranking_context import (
+    HistoryInfo, HistoryIndex, TestEvidence, TestIndex, matches, normalized,
+    parse_history,
+)
 
 
-class Symbol(NamedTuple):
-    name: str
-    kind: str
-    node: ast.AST
-    descendant_spans: Tuple[Tuple[int, int], ...]
+CLASS_ORDER = {"A": 0, "B": 1, "C": 2, "D": 3, "E": 4, "Z": 5}
 
 
-def ranges_to_lines(values: Sequence[Any]) -> Set[int]:
-    out = set()  # type: Set[int]
-    for value in values or []:
-        if isinstance(value, int):
-            out.add(value)
-        elif isinstance(value, (list, tuple)) and len(value) == 2:
-            a, b = int(value[0]), int(value[1])
-            out.update(range(a, b + 1))
-    return out
-
-
-def node_end(node: ast.AST) -> int:
-    end = getattr(node, "end_lineno", None)
-    if isinstance(end, int):
-        return end
-    maximum = int(getattr(node, "lineno", 1))
-    for child in ast.walk(node):
-        maximum = max(maximum, int(getattr(child, "lineno", maximum)))
-    return maximum
-
-
-def complexity(node: ast.AST) -> int:
-    branch_nodes = (
-        ast.If, ast.For, ast.AsyncFor, ast.While, ast.Try, ast.With,
-        ast.AsyncWith, ast.IfExp, ast.Assert, ast.comprehension,
-    )
-    match_type = getattr(ast, "Match", None)
-    score = 1
-    for child in ast.walk(node):
-        if isinstance(child, branch_nodes):
-            score += 1
-        elif isinstance(child, ast.BoolOp):
-            score += max(1, len(child.values) - 1)
-        elif match_type is not None and isinstance(child, match_type):
-            score += max(1, len(child.cases))
-    return score
-
-
-def dependency_cost(node: ast.AST) -> float:
-    score = 0.0
-    expensive_names = {
-        "requests", "httpx", "aiohttp", "socket", "subprocess", "multiprocessing",
-        "sqlalchemy", "boto3", "redis", "kafka", "time", "sleep", "random",
-        "open", "Path", "os", "shutil",
-    }
-    for child in ast.walk(node):
-        if isinstance(child, (ast.Await, ast.AsyncFor, ast.AsyncWith)):
-            score += 0.5
-        elif isinstance(child, ast.Call):
-            name = ""
-            if isinstance(child.func, ast.Name):
-                name = child.func.id
-            elif isinstance(child.func, ast.Attribute):
-                name = child.func.attr
-            if name in expensive_names:
-                score += 0.35
-        elif isinstance(child, (ast.Raise, ast.Try)):
-            score += 0.1
-    return min(score, 5.0)
-
-
-def public_bonus(name: str, kind: str) -> float:
-    if kind == "module":
-        return 0.0
-    return 0.5 if not name.split(".")[-1].startswith("_") else 0.0
-
-
-def _child_symbol_nodes(node: ast.AST) -> Iterable[ast.AST]:
-    for child in ast.iter_child_nodes(node):
-        if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
-            yield child
-        else:
-            for nested in _child_symbol_nodes(child):
-                yield nested
-
-
-def _all_descendant_symbol_spans(node: ast.AST) -> Tuple[Tuple[int, int], ...]:
-    spans = []  # type: List[Tuple[int, int]]
-    for child in _child_symbol_nodes(node):
-        spans.append((int(getattr(child, "lineno", 1)), node_end(child)))
-    return tuple(spans)
-
-
-def iter_symbols(tree: ast.AST) -> Iterable[Symbol]:
-    yield Symbol("<module>", "module", tree, _all_descendant_symbol_spans(tree))
-
-    def walk(body: Sequence[ast.stmt], prefix: str = "") -> Iterable[Symbol]:
-        for node in body:
-            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                name = "%s%s" % (prefix, node.name)
-                yield Symbol(name, "function", node, _all_descendant_symbol_spans(node))
-                for item in walk(node.body, name + "."):
-                    yield item
-            elif isinstance(node, ast.ClassDef):
-                cname = "%s%s" % (prefix, node.name)
-                yield Symbol(cname, "class", node, _all_descendant_symbol_spans(node))
-                for item in walk(node.body, cname + "."):
-                    yield item
-
-    for symbol in walk(getattr(tree, "body", [])):
-        yield symbol
-
-
-def owned_span(start: int, end: int, descendant_spans: Sequence[Tuple[int, int]]) -> Set[int]:
-    lines = set(range(start, end + 1))
-    for child_start, child_end in descendant_spans:
-        lines.difference_update(range(child_start, child_end + 1))
-    return lines
-
-
-def normalized(path: str) -> str:
-    return path.replace("\\", "/").lstrip("./")
-
-
-def matches(path: str, patterns: Sequence[str]) -> bool:
-    p = normalized(path)
-    return any(fnmatch.fnmatch(p, pattern) for pattern in patterns)
-
-
-def extract_file_data(data: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
+def extract_files(data: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
     files = data.get("files", {})
     if not isinstance(files, dict):
         raise ValueError("coverage JSON has no 'files' mapping")
     return files
 
 
-def rank_file(root: Path, reported_path: str, cov: Dict[str, Any]) -> List[Dict[str, Any]]:
+def promote(value: str) -> str:
+    return chr(ord(value) - 1) if value in ("B", "C", "D", "E") else value
+
+
+def demote(value: str) -> str:
+    return chr(ord(value) + 1) if value in ("A", "B", "C", "D") else value
+
+
+def choose_class(
+    kind: str,
+    is_public: bool,
+    setup_tier: int,
+    evidence: str,
+    history: HistoryInfo,
+    shared_setup: bool,
+) -> str:
+    if history.stable_skip_reason:
+        return "Z"
+    if kind == "function" and is_public and setup_tier <= 1 and evidence == "strong":
+        value = "A"
+    elif kind == "function" and is_public and setup_tier <= 1 and evidence == "weak":
+        value = "B"
+    elif kind == "function" and is_public and setup_tier <= 1:
+        value = "C"
+    elif setup_tier <= 2 and evidence != "none":
+        value = "D"
+    else:
+        value = "E"
+    if shared_setup:
+        value = promote(value)
+    if history.no_gain_attempts >= 2:
+        value = demote(value)
+    return value
+
+
+def action_for(value: str) -> str:
+    return {
+        "A": "ATTEMPT", "B": "ATTEMPT", "C": "INSPECT_THEN_ATTEMPT",
+        "D": "DEFER_UNLESS_NO_A_B_C", "E": "DEFER", "Z": "SKIP",
+    }[value]
+
+
+def selection_reasons(
+    value: str,
+    missing_lines: int,
+    missing_branches: int,
+    setup_tier: int,
+    evidence: TestEvidence,
+    shared_setup: bool,
+    history: HistoryInfo,
+) -> List[str]:
+    reasons = [
+        "class=%s" % value,
+        "missing_branches=%d" % missing_branches,
+        "missing_lines=%d" % missing_lines,
+        "setup_tier=%d" % setup_tier,
+        "test_evidence=%s" % evidence.level,
+    ]
+    if shared_setup:
+        reasons.append("same_file_previously_succeeded")
+    if history.no_gain_attempts:
+        reasons.append("previous_no_gain_attempts=%d" % history.no_gain_attempts)
+    if history.stable_skip_reason:
+        reasons.append("stable_skip=%s" % history.stable_skip_reason)
+    return reasons
+
+
+def rank_file(
+    root: Path,
+    reported_path: str,
+    coverage: Dict[str, Any],
+    tests: TestIndex,
+    history_index: HistoryIndex,
+) -> List[Dict[str, Any]]:
     source_path = Path(reported_path)
     if not source_path.is_absolute():
         source_path = root / source_path
@@ -160,10 +114,12 @@ def rank_file(root: Path, reported_path: str, cov: Dict[str, Any]) -> List[Dict[
     except (OSError, UnicodeError, SyntaxError):
         return []
 
-    executed = ranges_to_lines(cov.get("executed_lines", []))
-    missing = ranges_to_lines(cov.get("missing_lines", []))
+    source_file = normalized(os.path.relpath(str(source_path), str(root)))
+    executed = ranges_to_lines(coverage.get("executed_lines", []))
+    missing = ranges_to_lines(coverage.get("missing_lines", []))
     executable = executed | missing
-    missing_branches = cov.get("missing_branches", []) or []
+    missing_branches = coverage.get("missing_branches", []) or []
+    aliases = import_aliases(tree)
     results = []  # type: List[Dict[str, Any]]
 
     for symbol in iter_symbols(tree):
@@ -175,90 +131,127 @@ def rank_file(root: Path, reported_path: str, cov: Dict[str, Any]) -> List[Dict[
         symbol_missing = missing & span
         if not symbol_exec or not symbol_missing:
             continue
-        symbol_covered = executed & span
-        arcs = [
-            arc for arc in missing_branches
-            if isinstance(arc, list) and arc and arc[0] in span
-        ]
+        arcs = [arc for arc in missing_branches if isinstance(arc, list) and arc and arc[0] in span]
+        target = "%s::%s" % (source_file, name)
+        history = history_index.targets.get(target, HistoryInfo(0, 0, ""))
+        shared_setup = source_file in history_index.successful_files
+        evidence = tests.evidence_for(source_file, name)
+        setup_tier, boundary_flags = boundary_analysis(node, aliases)
         comp = complexity(node)
-        dep = dependency_cost(node)
+        value = choose_class(
+            kind, public_symbol(name, kind), setup_tier,
+            evidence.level, history, shared_setup,
+        )
         missing_count = len(symbol_missing)
         branch_count = len(arcs)
-        density = missing_count / max(1, len(symbol_exec))
-        setup_cost = 1.0 + math.log2(1 + comp) * 0.8 + dep
-        gain = missing_count + branch_count * 1.75
-        risk_bonus = min(2.0, math.log2(1 + comp) * 0.35)
-        score = (gain * (0.65 + density) * (1.0 + public_bonus(name, kind) + risk_bonus)) / setup_cost
         results.append({
-            "file": normalized(os.path.relpath(str(source_path), str(root))),
+            "target": target,
+            "file": source_file,
             "symbol": name,
             "kind": kind,
             "start_line": start,
             "end_line": end,
             "executable_lines": len(symbol_exec),
-            "covered_lines": len(symbol_covered),
+            "covered_lines": len(executed & span),
             "missing_lines": sorted(symbol_missing),
             "missing_line_count": missing_count,
             "missing_branches": arcs,
             "missing_branch_count": branch_count,
             "complexity_estimate": comp,
-            "dependency_cost": round(dep, 2),
-            "missing_density": round(density, 4),
-            "estimated_gain_units": round(gain, 2),
-            "priority_score": round(score, 4),
+            "setup_tier": setup_tier,
+            "boundary_flags": boundary_flags,
+            "public_entry_point": public_symbol(name, kind),
+            "test_evidence": {"level": evidence.level, "paths": list(evidence.paths)},
+            "history": {
+                "attempts": history.attempts,
+                "no_gain_attempts": history.no_gain_attempts,
+                "shared_setup": shared_setup,
+                "stable_skip_reason": history.stable_skip_reason,
+            },
+            "selection_class": value,
+            "agent_action": action_for(value),
+            "rank_vector": [CLASS_ORDER[value], -branch_count, -missing_count, comp],
+            "why_selected": selection_reasons(
+                value, missing_count, branch_count, setup_tier,
+                evidence, shared_setup, history,
+            ),
+            "agent_limits": {
+                "max_source_files_to_read": 4,
+                "max_test_attempts": 2,
+                "one_target_only": True,
+            },
+            "reject_reason_codes": [
+                "GENERATED", "VENDORED", "UNREACHABLE",
+                "PLATFORM_UNSUPPORTED", "EXTERNAL_INFRA_REQUIRED",
+                "NO_ASSERTABLE_BEHAVIOR",
+            ],
         })
     return results
 
 
+def test_roots(root: Path, supplied: Sequence[str]) -> List[Path]:
+    if supplied:
+        return [root / value for value in supplied]
+    return [path for path in (root / "tests", root / "test") if path.exists()]
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--coverage", required=True, help="coverage.py JSON file")
-    parser.add_argument("--root", default=".", help="repository root")
-    parser.add_argument("--output", default="-", help="output JSON path or -")
-    parser.add_argument("--include", action="append", default=[], help="glob to include; repeatable")
-    parser.add_argument("--exclude", nargs="*", default=[], help="glob patterns to exclude")
-    parser.add_argument("--top", type=int, default=100, help="maximum targets")
+    parser.add_argument("--coverage", required=True)
+    parser.add_argument("--root", default=".")
+    parser.add_argument("--output", default="-")
+    parser.add_argument("--include", action="append", default=[])
+    parser.add_argument("--exclude", nargs="*", default=[])
+    parser.add_argument("--tests-root", action="append", default=[])
+    parser.add_argument("--history", default="")
+    parser.add_argument("--include-skipped", action="store_true")
+    parser.add_argument("--top", type=int, default=100)
     args = parser.parse_args()
 
     root = Path(args.root).resolve()
     try:
         data = json.loads(Path(args.coverage).read_text(encoding="utf-8"))
-    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+    except (OSError, UnicodeError, ValueError) as exc:
         parser.error("cannot read coverage JSON: %s" % exc)
 
-    default_excludes = [
+    excludes = [
         "*/site-packages/*", "*/dist-packages/*", "*/.venv/*", "*/venv/*",
         "*/migrations/*", "*/generated/*", "*/__pycache__/*",
-    ]
-    excludes = default_excludes + list(args.exclude)
+    ] + list(args.exclude)
+    roots = test_roots(root, args.tests_root)
+    tests = TestIndex(root, roots)
+    history = parse_history(Path(args.history) if args.history else None)
     ranked = []  # type: List[Dict[str, Any]]
-    for reported_path, cov in extract_file_data(data).items():
-        p = normalized(reported_path)
-        if args.include and not matches(p, args.include):
+    for reported_path, coverage in extract_files(data).items():
+        path = normalized(reported_path)
+        if args.include and not matches(path, args.include):
             continue
-        if matches(p, excludes):
+        if matches(path, excludes):
             continue
-        ranked.extend(rank_file(root, reported_path, cov))
+        ranked.extend(rank_file(root, reported_path, coverage, tests, history))
 
-    ranked.sort(key=lambda item: (
-        -item["priority_score"], -item["estimated_gain_units"],
-        item["file"], item["start_line"],
-    ))
-    ranked = ranked[: max(0, args.top)]
+    if not args.include_skipped:
+        ranked = [item for item in ranked if item["selection_class"] != "Z"]
+    ranked.sort(key=lambda item: (tuple(item["rank_vector"]), item["file"], item["start_line"]))
+    ranked = ranked[:max(0, args.top)]
     payload = {
-        "schema_version": 1,
+        "schema_version": 2,
+        "methodology": "deterministic-selection-classes-v1",
         "source_coverage": str(Path(args.coverage)),
+        "source_history": args.history or None,
+        "test_roots": [normalized(os.path.relpath(str(path), str(root))) for path in roots],
         "coverage_totals": data.get("totals", {}),
         "target_count": len(ranked),
+        "selection_order": ["A", "B", "C", "D", "E", "Z"],
         "targets": ranked,
     }
     rendered = json.dumps(payload, indent=2, sort_keys=False)
     if args.output == "-":
         print(rendered)
     else:
-        out = Path(args.output)
-        out.parent.mkdir(parents=True, exist_ok=True)
-        out.write_text(rendered + "\n", encoding="utf-8")
+        output = Path(args.output)
+        output.parent.mkdir(parents=True, exist_ok=True)
+        output.write_text(rendered + "\n", encoding="utf-8")
     return 0
 
 

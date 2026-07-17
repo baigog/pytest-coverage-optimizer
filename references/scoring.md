@@ -1,54 +1,64 @@
-# Target ranking model
+# Deterministic target selection
 
-The ranking is deliberately heuristic. Its purpose is to reduce model context and produce a strong first work queue, not to replace local reasoning.
+The ranker does not estimate a universal numeric return on investment. It produces explicit selection classes that a small model can follow without inventing weights.
 
-## Quantities
+## Inputs per owned AST symbol
 
-For each AST symbol:
+- missing executable lines;
+- missing branch arcs originating in the symbol-owned line span;
+- owned-scope complexity, excluding nested functions, methods, and classes;
+- setup tier inferred from fully qualified call names;
+- public function status;
+- evidence that an existing test references the source module or symbol;
+- prior accepted, failed, no-gain, rejected, or deferred iterations.
 
-- `M`: missing executable lines.
-- `B`: missing branch arcs originating inside the symbol.
-- `E`: total executable lines.
-- `D = M/E`: missing density.
-- `C`: approximate cyclomatic complexity.
-- `X`: dependency/setup cost inferred from async constructs and calls commonly associated with I/O, processes, time, randomness, databases, and networks.
-- `P`: public API bonus.
+Parent class and module targets do not inherit missing lines, complexity, or dependency flags from descendant functions and methods.
 
-Estimated gain units:
+## Setup tiers
+
+| Tier | Meaning | Examples |
+|---|---|---|
+| 0 | Isolated synchronous logic | arithmetic, parsing, validation |
+| 1 | Standard pytest fixtures or monkeypatch | filesystem, environment, time, randomness |
+| 2 | Concurrency/process setup | async, subprocess, threading, multiprocessing |
+| 3 | External infrastructure | HTTP, sockets, databases, cloud SDKs, brokers |
+
+The analyzer resolves qualified names such as `requests.get`, `os.remove`, and `Path.read_text`. It does not infer cost from only the final attribute name.
+
+## Test evidence
+
+- `strong`: the test filename matches the source basename, or the test both imports the source module and references the symbol.
+- `weak`: the test imports the source module or references the symbol, but not both.
+- `none`: no matching test file was found.
+
+Evidence identifies where setup may already exist. It is not proof that the target is already tested.
+
+## Selection classes
+
+| Class | Rule |
+|---|---|
+| A | Public function, setup tier 0-1, strong test evidence |
+| B | Public function, setup tier 0-1, weak test evidence |
+| C | Public function, setup tier 0-1, no test evidence |
+| D | Setup tier 0-2 with test evidence, but not A-C |
+| E | All other candidates |
+| Z | Stable rejection from history |
+
+Within a class, sort by this lexicographic vector:
 
 ```text
-G = M + 1.75 * B
+[class_order, -missing_branch_count, -missing_line_count, complexity]
 ```
 
-Estimated setup cost:
+Path and start line break exact ties. No scalar score is used.
 
-```text
-K = 1 + 0.8 * log2(1 + C) + X
-```
+## History adaptation
 
-Priority is proportional to:
+- An accepted target marks its source file as having reusable setup. Remaining targets in that file are promoted by one class.
+- Two `failed` or `no_gain` attempts demote the target by one class.
+- `GENERATED`, `VENDORED`, `UNREACHABLE`, `PLATFORM_UNSUPPORTED`, and `EXTERNAL_INFRA_REQUIRED` are stable rejection reasons and place the target in class Z.
+- Coverage is regenerated after every accepted iteration, so already-covered targets naturally leave the queue.
 
-```text
-score = G * (0.65 + D) * (1 + P + risk_bonus) / K
-```
+## Why this method is intentionally limited
 
-Branch arcs are weighted more than lines because one test can execute a conditional line without testing both outcomes.
-
-## Human adjustment
-
-Raise priority for:
-
-- existing nearby fixtures/tests;
-- one public call reaching many missing lines;
-- important validation, state, money, permissions, persistence, or concurrency behavior;
-- deterministic behavior.
-
-Lower priority for:
-
-- external services or unavailable infrastructure;
-- generated/deprecated/platform-only code;
-- import-time-only gains;
-- trivial property/delegation lines with low defect risk;
-- defensive paths whose preconditions cannot occur through supported APIs.
-
-Re-rank after every accepted iteration because marginal gain changes.
+Static analysis cannot reliably determine semantic reachability, assertion quality, or real integration cost. The script performs only deterministic mechanical selection. The agent performs a fixed candidate gate for the first eligible target and may not override the class order by intuition.

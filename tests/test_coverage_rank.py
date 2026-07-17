@@ -227,6 +227,7 @@ def test_two_no_gain_attempts_demote_candidate(tmp_path):
     assert item["history"]["no_gain_attempts"] == 2
 
 
+
 def test_query_coverage_returns_requested_slice(tmp_path):
     coverage = {
         "files": {
@@ -286,7 +287,10 @@ def test_scripts_parse_with_python_37_grammar():
         root / "scripts" / "query_coverage.py",
     ]:
         source = path.read_text(encoding="utf-8")
-        ast.parse(source, filename=str(path), feature_version=(3, 7))
+        if sys.version_info[:2] == (3, 7):
+            compile(source, str(path), "exec")
+        else:
+            ast.parse(source, filename=str(path), feature_version=(3, 7))
 
 
 def test_class_order_is_not_overridden_by_larger_raw_gain(tmp_path):
